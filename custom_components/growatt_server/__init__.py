@@ -177,6 +177,55 @@ async def async_migrate_entry(
     return True
 
 
+def _get_classic_device_list_with_fallback(
+    api: growattServer.GrowattApi, plant_id: str
+) -> list[dict[str, str]]:
+    """Get device list, supplementing from plant_info if devices are missing.
+
+    The library's device_list() can miss devices because it looks for 'deviceList'
+    in the plant_info response, but some Growatt API responses use type-specific
+    lists ('invList', 'tlxList', etc.) instead. This function supplements the
+    device list by also checking those type-specific lists.
+    """
+    devices = api.device_list(plant_id)
+
+    existing_sns = {d["deviceSn"] for d in devices if "deviceSn" in d}
+    try:
+        info = api.plant_info(plant_id)
+    except (RequestException, JSONDecodeError):
+        info = {}
+
+    # Map plant_info list keys to device types.
+    # 'invList' contains inverters that may be TLX/MIN/MIC/NEO types - the
+    # coordinator handles them all via tlx_detail(), so we map to "tlx".
+    inv_list_type_map = {
+        "invList": "tlx",
+        "tlxList": "tlx",
+        "mixList": "mix",
+        "stoList": "storage",
+    }
+    valid_types = {"inverter", "tlx", "storage", "mix", "min"}
+    for list_key, default_type in inv_list_type_map.items():
+        for inv in info.get(list_key, []):
+            sn = inv.get("deviceSn") or inv.get("sn") or inv.get("serialNum")
+            if sn and sn not in existing_sns:
+                # Use deviceType from entry only if it's a recognized string type,
+                # otherwise use the default type inferred from the list key
+                raw_type = inv.get("deviceType")
+                dtype = raw_type if isinstance(raw_type, str) and raw_type in valid_types else default_type
+                devices.append({"deviceSn": sn, "deviceType": dtype})
+                existing_sns.add(sn)
+                _LOGGER.info(
+                    "Device %s found in plant_info '%s' but missing from "
+                    "device_list, adding as type '%s'",
+                    sn,
+                    list_key,
+                    dtype,
+                )
+
+    return devices
+
+
 def get_device_list_classic(
     api: growattServer.GrowattApi, config: Mapping[str, str]
 ) -> tuple[list[dict[str, str]], str]:
@@ -216,7 +265,7 @@ def get_device_list_classic(
 
     # Get a list of devices for specified plant to add sensors for.
     try:
-        devices = api.device_list(plant_id)
+        devices = _get_classic_device_list_with_fallback(api, plant_id)
     except (RequestException, JSONDecodeError) as ex:
         raise ConfigEntryError(
             f"Error communicating with Growatt API during device list: {ex}"
@@ -528,7 +577,9 @@ async def async_setup_entry(
         )
     else:
         # Classic API: Use throttle manager to prevent rate limiting
-        devices = await hass.async_add_executor_job(api.device_list, plant_id)
+        devices = await hass.async_add_executor_job(
+            _get_classic_device_list_with_fallback, api, plant_id
+        )
 
     # Create a coordinator for the total sensors
     total_coordinator = GrowattCoordinator(
