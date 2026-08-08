@@ -133,6 +133,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # The V1 Plant APIs do not provide the same information as the classic plant_info() API
                 # More specifically:
                 # 1. There is no monetary information to be found, so today and lifetime money is not available
+                #    (the money sensors are therefore not created at all on V1, see sensor/__init__.py)
                 # This means, for the total coordinator we fetch and map the following:
                 # todayEnergy -> today_energy
                 # totalEnergy -> total_energy

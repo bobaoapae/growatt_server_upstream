@@ -695,3 +695,34 @@ async def test_solar_generation_today_prefers_api_value(
     state = hass.states.get("sensor.min123456_solar_energy_today")
     assert state is not None
     assert state.state == "7.5"
+
+
+async def test_money_sensors_not_created_on_v1(
+    hass: HomeAssistant,
+    mock_growatt_v1_api,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the currency sensors are skipped on V1, which has no monetary data."""
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert hass.states.get("sensor.test_plant_total_money_lifetime") is None
+    assert hass.states.get("sensor.test_plant_total_total_money_today") is None
+    # ... while the rest of the total sensors are still there
+    assert hass.states.get("sensor.test_plant_total_energy_today") is not None
+
+
+async def test_money_sensors_created_on_classic(
+    hass: HomeAssistant,
+    mock_growatt_classic_api,
+    mock_config_entry_classic: MockConfigEntry,
+) -> None:
+    """Test the currency sensors still exist on the classic API, which reports money."""
+    mock_growatt_classic_api.device_list.return_value = [
+        {"deviceSn": "TLX123456", "deviceType": "tlx"}
+    ]
+
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry_classic)
+
+    assert hass.states.get("sensor.test_plant_total_total_money_today") is not None
