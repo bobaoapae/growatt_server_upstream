@@ -183,6 +183,20 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             min_energy = self.api.min_energy(self.device_id)
 
             min_info = {**min_details, **min_settings, **min_energy}
+
+            # tlx_last_data returns epvTotal but no epvToday, which leaves the
+            # "solar generation today" sensor unknown for the whole life of the
+            # entity. The per-string epv{1..4}Today values are present, so add
+            # the missing total up from them.
+            if min_info.get("epvToday") is None:
+                strings = [
+                    _as_float(min_info[key])
+                    for key in ("epv1Today", "epv2Today", "epv3Today", "epv4Today")
+                    if min_info.get(key) is not None
+                ]
+                if strings and None not in strings:
+                    min_info["epvToday"] = round(sum(strings), 2)
+
             self.data = min_info
             _LOGGER.debug("min_info for device %s: %r", self.device_id, min_info)
         elif self.device_type == "sph":

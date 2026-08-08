@@ -649,3 +649,49 @@ async def test_total_output_power_falls_back_to_devices(
     state = hass.states.get("sensor.test_plant_total_output_power")
     assert state is not None
     assert state.state == "1491.0"
+
+
+async def test_solar_generation_today_derived_from_strings(
+    hass: HomeAssistant,
+    mock_growatt_v1_api,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test epvToday is added up from the per-string values when absent.
+
+    tlx_last_data returns epvTotal but no epvToday, which otherwise leaves the
+    sensor unknown forever.
+    """
+    mock_growatt_v1_api.min_energy.return_value = {
+        "epvTotal": 4997.1,
+        "epv1Today": 0.5,
+        "epv2Today": 0.5,
+        "epv3Today": 0.5,
+        "epv4Today": 0.5,
+    }
+
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry)
+
+    state = hass.states.get("sensor.min123456_solar_energy_today")
+    assert state is not None
+    assert state.state == "2.0"
+
+
+async def test_solar_generation_today_prefers_api_value(
+    hass: HomeAssistant,
+    mock_growatt_v1_api,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test a real epvToday from the API is never overwritten by the derived sum."""
+    mock_growatt_v1_api.min_energy.return_value = {
+        "epvToday": 7.5,
+        "epv1Today": 0.5,
+        "epv2Today": 0.5,
+    }
+
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry)
+
+    state = hass.states.get("sensor.min123456_solar_energy_today")
+    assert state is not None
+    assert state.state == "7.5"
