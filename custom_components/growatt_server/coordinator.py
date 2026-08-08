@@ -9,6 +9,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import growattServer
+from requests import RequestException
 
 from homeassistant.components.sensor import SensorStateClass
 from homeassistant.config_entries import ConfigEntry
@@ -32,6 +33,18 @@ if TYPE_CHECKING:
 type GrowattConfigEntry = ConfigEntry[GrowattRuntimeData]
 
 SCAN_INTERVAL = datetime.timedelta(minutes=5)
+
+# The Growatt cloud drops requests fairly regularly (connection resets, read
+# timeouts, the odd 502 or DNS blip). Failing the update on the very first one
+# turns every entity of the plant unavailable for a full poll cycle, so serve
+# the cached data for a couple of attempts and only give up once the failures
+# persist.
+MAX_TRANSIENT_FAILURES = 3
+
+# V1 Open API error codes that mean "you called this endpoint again too soon".
+# Each endpoint allows one call per 5 minutes; a restart landing inside that
+# window is enough to trigger it, and the next poll goes through normally.
+RATE_LIMIT_ERROR_CODES = {10011, 10012}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +94,7 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.plant_id = plant_id
         self.previous_values: dict[str, Any] = {}
         self._pre_reset_values: dict[str, float] = {}
+        self._consecutive_failures = 0
 
         # Use the shared API instance from runtime_data (already logged in for Classic API)
         self.api = config_entry.runtime_data.api
@@ -125,24 +139,22 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif self.device_type == "inverter":
             self.data = self.api.inverter_detail(self.device_id)
         elif self.device_type == "min":
-            # Open API V1: min device
-            try:
-                min_details = self.api.min_detail(self.device_id)
-                min_settings = self.api.min_settings(self.device_id)
-                min_energy = self.api.min_energy(self.device_id)
-            except growattServer.GrowattV1ApiError as err:
-                raise UpdateFailed(f"Error fetching min device data: {err}") from err
+            # Open API V1: min device.
+            # GrowattV1ApiError is deliberately left to propagate: it is handled
+            # centrally in _async_update_data, which can tell a routine rate
+            # limit apart from a real API failure.
+            min_details = self.api.min_detail(self.device_id)
+            min_settings = self.api.min_settings(self.device_id)
+            min_energy = self.api.min_energy(self.device_id)
 
             min_info = {**min_details, **min_settings, **min_energy}
             self.data = min_info
             _LOGGER.debug("min_info for device %s: %r", self.device_id, min_info)
         elif self.device_type == "sph":
-            # Open API V1: SPH device (single-phase hybrid)
-            try:
-                sph_detail = self.api.sph_detail(self.device_id)
-                sph_energy = self.api.sph_energy(self.device_id)
-            except growattServer.GrowattV1ApiError as err:
-                raise UpdateFailed(f"Error fetching SPH device data: {err}") from err
+            # Open API V1: SPH device (single-phase hybrid).
+            # As for "min", GrowattV1ApiError is handled in _async_update_data.
+            sph_detail = self.api.sph_detail(self.device_id)
+            sph_energy = self.api.sph_energy(self.device_id)
 
             combined = {**sph_detail, **sph_energy}
 
@@ -280,10 +292,30 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.error("Re-login exception: %s", err)
                 return False
 
+    def _serve_cached_or_fail(self, err: Exception, reason: str) -> dict[str, Any]:
+        """Ride out a transient failure on cached data, or give up on it.
+
+        Growatt's cloud fails often enough that treating every hiccup as an
+        outage makes the entities flap; keep the previous reading for the first
+        few consecutive failures and only surface UpdateFailed once they stop
+        looking transient.
+        """
+        self._consecutive_failures += 1
+        if self.data and self._consecutive_failures < MAX_TRANSIENT_FAILURES:
+            _LOGGER.warning(
+                "%s (attempt %s/%s), keeping last known data: %s",
+                reason,
+                self._consecutive_failures,
+                MAX_TRANSIENT_FAILURES,
+                err,
+            )
+            return self.data
+        raise UpdateFailed(f"{reason}: {err}") from err
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Asynchronously update data via library."""
         try:
-            return await self.hass.async_add_executor_job(self._sync_update_data)
+            data = await self.hass.async_add_executor_job(self._sync_update_data)
         except json.decoder.JSONDecodeError as err:
             # Session expired — server returned HTML login page instead of JSON
             if self.api_version == "classic":
@@ -295,14 +327,37 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if await self._async_re_login():
                     try:
-                        return await self.hass.async_add_executor_job(
+                        data = await self.hass.async_add_executor_job(
                             self._sync_update_data
                         )
                     except json.decoder.JSONDecodeError as retry_err:
                         raise UpdateFailed(
                             f"Data fetch failed after re-login: {retry_err}"
                         ) from retry_err
+                    else:
+                        self._consecutive_failures = 0
+                        return data
             raise UpdateFailed(f"Error fetching data: {err}") from err
+        except growattServer.GrowattV1ApiError as err:
+            # GrowattV1ApiError is not a RequestException, so anything that does
+            # not catch it explicitly escapes the coordinator as an "Unexpected
+            # error" traceback and gets treated as a bug in the integration
+            # rather than as a retryable API failure. Rate limiting in
+            # particular is routine, not exceptional.
+            if getattr(err, "error_code", None) in RATE_LIMIT_ERROR_CODES:
+                return self._serve_cached_or_fail(
+                    err, f"Growatt API rate limit hit for {self.device_id}"
+                )
+            raise UpdateFailed(
+                f"Growatt API error fetching {self.device_id}: {err}"
+            ) from err
+        except (RequestException, TimeoutError) as err:
+            return self._serve_cached_or_fail(
+                err, f"Transient error fetching {self.device_id}"
+            )
+        else:
+            self._consecutive_failures = 0
+            return data
 
     def get_currency(self):
         """Get the currency."""
