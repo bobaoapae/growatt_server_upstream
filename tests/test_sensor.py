@@ -583,3 +583,69 @@ async def test_non_rate_limit_api_error_fails_immediately(
     async_fire_time_changed(hass)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_total_nominal_power_from_peak_power_actual(
+    hass: HomeAssistant,
+    mock_growatt_v1_api,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Test the plant's maximum power comes from peak_power_actual on V1.
+
+    The V1 plant endpoint has no nominalPower field, but it does report the
+    plant's nominal power in kW as peak_power_actual.
+    """
+    mock_growatt_v1_api.plant_energy_overview.return_value = {
+        "today_energy": 12.5,
+        "total_energy": 1250.0,
+        "current_power": 2500,
+        "peak_power_actual": 12,
+    }
+
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry)
+
+    state = hass.states.get("sensor.test_plant_total_maximum_power")
+    assert state is not None
+    assert state.state == "12000.0"
+
+
+async def test_total_output_power_falls_back_to_devices(
+    hass: HomeAssistant,
+    mock_growatt_v1_api,
+    mock_config_entry: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test plant output power is summed from the inverters when the plant reports 0.
+
+    The Growatt cloud regularly returns current_power = 0 while the inverters
+    themselves report AC output.
+    """
+    mock_growatt_v1_api.device_list.return_value = {
+        "devices": [
+            {"device_sn": "MIN123456", "type": 7},
+            {"device_sn": "MIN654321", "type": 7},
+        ]
+    }
+    mock_growatt_v1_api.plant_energy_overview.return_value = {
+        "today_energy": 12.5,
+        "total_energy": 1250.0,
+        "current_power": 0,
+    }
+    mock_growatt_v1_api.min_detail.return_value = {
+        "deviceSn": "MIN123456",
+        "pac": 745.5,
+    }
+
+    with patch("homeassistant.components.growatt_server.PLATFORMS", [Platform.SENSOR]):
+        await setup_integration(hass, mock_config_entry)
+
+    # The total coordinator does its first refresh before the devices have any
+    # data, so the fallback only has something to sum from the next poll on.
+    freezer.tick(timedelta(minutes=5))
+    async_fire_time_changed(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    state = hass.states.get("sensor.test_plant_total_output_power")
+    assert state is not None
+    assert state.state == "1491.0"

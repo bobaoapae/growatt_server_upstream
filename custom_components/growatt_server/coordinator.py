@@ -49,6 +49,21 @@ RATE_LIMIT_ERROR_CODES = {10011, 10012}
 _LOGGER = logging.getLogger(__name__)
 
 
+def _as_float(value: Any) -> float | None:
+    """Coerce an API value to float, or None when it isn't numeric.
+
+    The V1 API is inconsistent about types - the same field comes back as an
+    int, a float or a decimal string depending on the endpoint, and empty
+    strings are used for "no value".
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to manage Growatt data fetching.
 
@@ -118,15 +133,35 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # The V1 Plant APIs do not provide the same information as the classic plant_info() API
                 # More specifically:
                 # 1. There is no monetary information to be found, so today and lifetime money is not available
-                # 2. There is no nominal power, this is provided by inverter min_energy()
-                # This means, for the total coordinator we can only fetch and map the following:
+                # This means, for the total coordinator we fetch and map the following:
                 # todayEnergy -> today_energy
                 # totalEnergy -> total_energy
                 # invTodayPpv -> current_power
+                # nominalPower -> peak_power_actual
                 total_info = self.api.plant_energy_overview(self.plant_id)
                 total_info["todayEnergy"] = total_info["today_energy"]
                 total_info["totalEnergy"] = total_info["total_energy"]
                 total_info["invTodayPpv"] = total_info["current_power"]
+
+                # plant/data does carry the plant's nominal power, in kW, under
+                # peak_power_actual. The classic plant_info() reports nominalPower
+                # in W, which is what the sensor is declared as, so scale it.
+                # Without this the "maximum output" sensor stays unknown forever.
+                nominal_power = _as_float(total_info.get("peak_power_actual"))
+                if nominal_power is not None:
+                    total_info["nominalPower"] = nominal_power * 1000
+
+                # current_power is regularly pinned at 0 by the Growatt cloud even
+                # when the plant is demonstrably producing (verified against
+                # /v1/plant/power, which reported kW-level output for the very same
+                # minute plant/data returned 0). The per-device coordinators do get
+                # a live AC figure, so fall back to summing those - that data is
+                # already fetched, so this costs no extra call against the
+                # one-request-per-5-minutes limit.
+                if not _as_float(total_info["invTodayPpv"]):
+                    device_power = self._sum_device_output_power()
+                    if device_power is not None:
+                        total_info["invTodayPpv"] = device_power
             else:
                 # Classic API: use plant_info as before
                 total_info = self.api.plant_info(self.device_id)
@@ -233,6 +268,22 @@ class GrowattCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         return self.data
+
+    def _sum_device_output_power(self) -> float | None:
+        """Return the plant's AC output as the sum of its inverters' `pac`.
+
+        Used as a fallback for the total coordinator when the plant endpoint
+        reports no current power. Returns None when no device has reported a
+        usable value yet - notably on the first refresh after a restart, where
+        the total coordinator runs before the device coordinators.
+        """
+        devices = getattr(self.config_entry.runtime_data, "devices", None) or {}
+        total: float | None = None
+        for coordinator in devices.values():
+            power = _as_float((coordinator.data or {}).get("pac"))
+            if power is not None:
+                total = power if total is None else total + power
+        return total
 
     async def _async_re_login(self) -> bool:
         """Attempt to re-login to the Growatt API when session expires (Classic API only).
