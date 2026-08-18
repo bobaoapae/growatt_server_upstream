@@ -33,6 +33,7 @@ from .const import (
     LOGIN_INVALID_AUTH_CODE,
     SERVER_URLS_NAMES,
 )
+from .http_timeout import apply_default_timeout
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +86,7 @@ class GrowattServerConfigFlow(ConfigFlow, domain=DOMAIN):
                     agent_identifier=user_input[CONF_USERNAME],
                 )
                 api.server_url = server_url
+                apply_default_timeout(api)
 
                 try:
                     login_response = await self.hass.async_add_executor_job(
@@ -115,6 +117,7 @@ class GrowattServerConfigFlow(ConfigFlow, domain=DOMAIN):
                 server_url = SERVER_URLS_NAMES[user_input[CONF_REGION]]
                 api = growattServer.OpenApiV1(token=user_input[CONF_TOKEN])
                 api.server_url = server_url
+                apply_default_timeout(api)
 
                 try:
                     plant_response = await self.hass.async_add_executor_job(
@@ -195,6 +198,7 @@ class GrowattServerConfigFlow(ConfigFlow, domain=DOMAIN):
             add_random_user_id=True, agent_identifier=user_input[CONF_USERNAME]
         )
         self.api.server_url = server_url
+        apply_default_timeout(self.api)
 
         try:
             login_response = await self.hass.async_add_executor_job(
@@ -235,6 +239,7 @@ class GrowattServerConfigFlow(ConfigFlow, domain=DOMAIN):
 
         self.api = growattServer.OpenApiV1(token=user_input[CONF_TOKEN])
         self.api.server_url = server_url
+        apply_default_timeout(self.api)
 
         # Verify token by fetching plant list
         try:

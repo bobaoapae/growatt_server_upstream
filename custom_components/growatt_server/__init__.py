@@ -29,6 +29,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import GrowattConfigEntry, GrowattCoordinator
+from .http_timeout import apply_default_timeout
 from .models import GrowattRuntimeData
 from .services import async_register_services
 
@@ -118,6 +119,7 @@ async def async_migrate_entry(
                         add_random_user_id=True, agent_identifier=username
                     )
                     api.server_url = url
+                    apply_default_timeout(api)
 
                     login_response = await hass.async_add_executor_job(
                         api.login, username, password
@@ -475,6 +477,7 @@ async def async_setup_entry(
         # V1 API (token-based, no login needed)
         token = config[CONF_TOKEN]
         api = growattServer.OpenApiV1(token=token)
+        apply_default_timeout(api)
         plant_id = config[CONF_PLANT_ID]
     elif config.get(CONF_AUTH_TYPE) == AUTH_PASSWORD:
         # Classic API (username/password with login)
@@ -505,6 +508,7 @@ async def async_setup_entry(
                 add_random_user_id=True, agent_identifier=username
             )
             api.server_url = url
+            apply_default_timeout(api)
             login_response = await hass.async_add_executor_job(
                 api.login, username, password
             )
